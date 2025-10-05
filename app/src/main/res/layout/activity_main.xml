@@ -9,7 +9,14 @@
         android:id="@+id/drawView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
-
+    <!-- floating property bar anchored bottom-center -->
+    <include
+        android:id="@+id/shapePropertyBar"
+        layout="@layout/view_shape_properties"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="24dp"/>
     <!-- Sidebar for actions to be performed -->
     <LinearLayout
         android:id="@+id/sidebar"
