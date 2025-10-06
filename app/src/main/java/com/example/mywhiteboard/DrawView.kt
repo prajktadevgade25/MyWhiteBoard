@@ -2,19 +2,22 @@ package com.example.mywhiteboard
 
 import android.content.Context
 import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import android.graphics.drawable.Drawable
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import androidx.appcompat.content.res.AppCompatResources
 import kotlin.math.*
 
 /**
- * Public top-level model so Activity/UI can inspprivate val deleteIconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
- *     color = Color.RED
- *     style = Paint.Style.FILL
- * }
- *
- * private val deleteIconRadius = 40fect/update selection.
+ * Model representing a single shape on the whiteboard.
+ * 'color' is the stroke (border) color. 'fillEnabled' + 'fillColor' control filling.
  */
 data class ShapeModel(
     var id: String,
@@ -23,10 +26,10 @@ data class ShapeModel(
     var top: Float,
     var right: Float,
     var bottom: Float,
-    var rotation: Float = 0f,            // degrees
-    var color: Int = Color.BLACK,        // border color
-    var strokeWidth: Float = 6f,         // border width
-    var fillEnabled: Boolean = false,    // whether filled
+    var rotation: Float = 0f,
+    var color: Int,
+    var strokeWidth: Float = 6f,
+    var fillEnabled: Boolean = false,
     var fillColor: Int = Color.TRANSPARENT
 ) {
     fun centerX() = (left + right) / 2f
@@ -36,17 +39,20 @@ data class ShapeModel(
 }
 
 /**
- * DrawView: freehand strokes + shape creation + selection/transform + per-shape properties.
+ * DrawView: freehand strokes and shapes (create/select/transform/delete) with per-shape properties.
  */
 class DrawView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
 ) : View(context, attrs, defStyle) {
 
+    // public enums
     enum class Mode { PEN, ERASER, SHAPE, TEXT }
     enum class Shape { RECT, CIRCLE, LINE, POLYGON }
 
-    // ---------- Base paint / stroke ------------
+    // dp helper
+    private val Float.dp: Float get() = this * resources.displayMetrics.density
 
+    // ---------- base paint for freehand strokes ----------
     private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         style = Paint.Style.STROKE
@@ -54,27 +60,15 @@ class DrawView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
         strokeWidth = 12f
     }
-    private val deleteIconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.RED
-        style = Paint.Style.FILL
-    }
 
-    private val deleteIconRadius = 40f
-    private val deleteIconPadding = 10f
+    // ---------- delete icon (vector or raster) ----------
+    private var deleteBitmapScaled: Bitmap? = null
+    private val deleteSizeDp: Float
+        get() = 32f.dp
+    private val deleteHitRadius: Float
+        get() = (deleteSizeDp / 2f) * 1.15f
 
-    private data class Stroke(val path: Path, val paint: Paint)
-
-    private val strokes = mutableListOf<Stroke>()
-    private val activePaths = mutableMapOf<Int, Path>()
-    private val activePaints = mutableMapOf<Int, Paint>()
-
-    // shape preview start per pointer
-    private val shapeStart = mutableMapOf<Int, Pair<Float, Float>>()
-
-    // background
-    private var backgroundColor = Color.WHITE
-
-    // public config
+    // ---------- stroke / shape defaults ----------
     var mode: Mode = Mode.PEN
     var shape: Shape = Shape.RECT
 
@@ -90,8 +84,6 @@ class DrawView @JvmOverloads constructor(
             basePaint.strokeWidth = value
         }
 
-    // ---------- Shape defaults / per-shape creation config ----------
-    /** If >0: tap (no drag) creates a shape with this width/height centered at tap */
     var shapeDefaultWidth: Float = 0f
     var shapeDefaultHeight: Float = 0f
 
@@ -101,26 +93,33 @@ class DrawView @JvmOverloads constructor(
     var shapeFillColor: Int = Color.TRANSPARENT
     var shapeFillEnabled: Boolean = false
 
-    // ---------- Shapes storage + selection ----------
+    // ---------- internal stroke bookkeeping ----------
+    private data class Stroke(val path: Path, val paint: Paint)
+
+    private val strokes = mutableListOf<Stroke>()
+    private val activePaths = mutableMapOf<Int, Path>()
+    private val activePaints = mutableMapOf<Int, Paint>()
+
+    // ---------- shape creation preview ----------
+    private val shapeStart = mutableMapOf<Int, Pair<Float, Float>>()
+
+    // ---------- shapes and selection ----------
     private val shapes = mutableListOf<ShapeModel>()
     private var _selectedShape: ShapeModel? = null
-
-    // Use setSelected(...) to change selection so listeners fire
     private fun setSelected(s: ShapeModel?) {
         _selectedShape = s
-        selectionListener?.invoke(getSelectedShape()) // send a copy / snapshot
+        selectionListener?.invoke(getSelectedShape())
         invalidate()
     }
 
     fun getSelectedShape(): ShapeModel? = _selectedShape?.copy()
 
-    // ---------- Selection listener ----------
     private var selectionListener: ((ShapeModel?) -> Unit)? = null
     fun setOnSelectionChangedListener(listener: (ShapeModel?) -> Unit) {
         selectionListener = listener
     }
 
-    // ---------- paints for drawing shapes & selection ----------
+    // ---------- paints for rendering shapes and selection ----------
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -137,30 +136,54 @@ class DrawView @JvmOverloads constructor(
     private val rotateHandlePaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = Color.YELLOW }
 
-    // handle size
-    private val Float.dp get() = this * resources.displayMetrics.density
     private val HANDLE_SIZE = 14f.dp
     private val ROTATE_HANDLE_DISTANCE = 36f.dp
 
-    // hit / transform tracking
+    // ---------- hit/transform tracking ----------
     private enum class HitType { NONE, INSIDE, ROTATE, HANDLE_LT, HANDLE_T, HANDLE_RT, HANDLE_R, HANDLE_RB, HANDLE_B, HANDLE_LB, HANDLE_L }
 
     private var activeHit = HitType.NONE
     private var activePointerId = -1
     private var lastTouchX = 0f
     private var lastTouchY = 0f
-
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
-    // ---------- Drawing ----------
+    // ---------- helper: load drawable (vector supported) into bitmap of desired size ----------
+    private fun drawableToBitmap(drawable: Drawable, size: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(canvas)
+        return bmp
+    }
+
+    private fun ensureDeleteBitmap() {
+        val size = deleteSizeDp.toInt().coerceAtLeast(1)
+        val cur = deleteBitmapScaled
+        if (cur != null && cur.width == size && cur.height == size) return
+
+        val drawable: Drawable? = try {
+            AppCompatResources.getDrawable(context, R.drawable.ic_delete)
+        } catch (e: Exception) {
+            try {
+                context.resources.getDrawable(R.drawable.ic_delete, context.theme)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        deleteBitmapScaled = drawable?.let { drawableToBitmap(it, size) }
+    }
+
+    // ---------- drawing ----------
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawColor(backgroundColor)
+        canvas.drawColor(Color.WHITE)
 
         // draw freehand strokes
         for (s in strokes) canvas.drawPath(s.path, s.paint)
 
-        // draw committed shapes
+        // draw shapes
         for (s in shapes) drawShapeModel(canvas, s)
 
         // draw previews (activePaths)
@@ -169,7 +192,7 @@ class DrawView @JvmOverloads constructor(
             canvas.drawPath(path, p)
         }
 
-        // draw selection
+        // draw selection if any
         _selectedShape?.let { drawSelection(canvas, it) }
     }
 
@@ -179,7 +202,6 @@ class DrawView @JvmOverloads constructor(
         val cy = s.centerY()
         canvas.rotate(s.rotation, cx, cy)
 
-        // fill then stroke
         if (s.fillEnabled) {
             fillPaint.color = s.fillColor
             canvas.drawPath(buildShapePath(s), fillPaint)
@@ -229,8 +251,11 @@ class DrawView @JvmOverloads constructor(
         val cy = s.centerY()
         canvas.rotate(s.rotation, cx, cy)
         val rect = RectF(s.left, s.top, s.right, s.bottom)
+
+        // dashed rect
         canvas.drawRect(rect, selectionPaint)
 
+        // handles
         val handles = getHandlePoints(rect)
         for (pt in handles) {
             val left = pt.x - HANDLE_SIZE / 2f
@@ -240,90 +265,110 @@ class DrawView @JvmOverloads constructor(
             canvas.drawRect(r, handleBorderPaint)
         }
 
+        // rotate handle (top center)
         val topCenter = PointF((rect.left + rect.right) / 2f, rect.top - ROTATE_HANDLE_DISTANCE)
         canvas.drawCircle(topCenter.x, topCenter.y, HANDLE_SIZE / 2f, rotateHandlePaint)
         canvas.drawCircle(topCenter.x, topCenter.y, HANDLE_SIZE / 2f, handleBorderPaint)
 
-        // delete handle
-        val delX = rect.right + deleteIconPadding + deleteIconRadius
-        val delY = rect.top - deleteIconPadding - deleteIconRadius
-        canvas.drawCircle(delX, delY, deleteIconRadius, deleteIconPaint)
-        val xPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            strokeWidth = 6f
-            style = Paint.Style.STROKE
+        // delete - draw red circular background then drawable on top
+        val localDelX = rect.right + 8f.dp + (deleteSizeDp / 2f)
+        val localDelY = rect.top - 8f.dp - (deleteSizeDp / 2f)
+
+        val redBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.TRANSPARENT; style = Paint.Style.FILL
         }
-        canvas.drawLine(delX - 15, delY - 15, delX + 15, delY + 15, xPaint)
-        canvas.drawLine(delX - 15, delY + 15, delX + 15, delY - 15, xPaint)
+        val bgRadius = deleteSizeDp / 2f
+        canvas.drawCircle(localDelX, localDelY, bgRadius, redBgPaint)
+
+        ensureDeleteBitmap()
+        deleteBitmapScaled?.let { bmp ->
+            val left = localDelX - bmp.width / 2f
+            val top = localDelY - bmp.height / 2f
+            canvas.drawBitmap(bmp, left, top, null)
+        } ?: run {
+            // fallback: white X
+            val xPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; strokeWidth = 3f.dp; style = Paint.Style.STROKE
+            }
+            val cross = 8f.dp
+            canvas.drawLine(
+                localDelX - cross, localDelY - cross, localDelX + cross, localDelY + cross, xPaint
+            )
+            canvas.drawLine(
+                localDelX - cross, localDelY + cross, localDelX + cross, localDelY - cross, xPaint
+            )
+        }
 
         canvas.restoreToCount(save)
     }
 
-    private fun getHandlePoints(rect: RectF): List<PointF> {
-        return listOf(
-            PointF(rect.left, rect.top),                        // LT
-            PointF((rect.left + rect.right) / 2f, rect.top),    // T
-            PointF(rect.right, rect.top),                       // RT
-            PointF(rect.right, (rect.top + rect.bottom) / 2f),  // R
-            PointF(rect.right, rect.bottom),                    // RB
-            PointF((rect.left + rect.right) / 2f, rect.bottom), // B
-            PointF(rect.left, rect.bottom),                     // LB
-            PointF(rect.left, (rect.top + rect.bottom) / 2f)    // L
-        )
-    }
+    private fun getHandlePoints(rect: RectF): List<PointF> = listOf(
+        PointF(rect.left, rect.top),
+        PointF((rect.left + rect.right) / 2f, rect.top),
+        PointF(rect.right, rect.top),
+        PointF(rect.right, (rect.top + rect.bottom) / 2f),
+        PointF(rect.right, rect.bottom),
+        PointF((rect.left + rect.right) / 2f, rect.bottom),
+        PointF(rect.left, rect.bottom),
+        PointF(rect.left, (rect.top + rect.bottom) / 2f)
+    )
 
-    // ---------- Touch handling ----------
+    // ---------- touch handling ----------
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
         val y = event.y
 
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                activePointerId = event.getPointerId(0)
-                lastTouchX = x; lastTouchY = y
+        // quick delete-check on ACTION_DOWN (use same coords as drawSelection)
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            activePointerId = event.getPointerId(0)
+            lastTouchX = x; lastTouchY = y
+            _selectedShape?.let { shape ->
+                val rect = RectF(shape.left, shape.top, shape.right, shape.bottom)
+                val localDelX = rect.right + 8f.dp + (deleteSizeDp / 2f)
+                val localDelY = rect.top - 8f.dp - (deleteSizeDp / 2f)
+                // rotate this local point to screen coords
+                val cx = shape.centerX();
+                val cy = shape.centerY()
+                val ang = Math.toRadians(shape.rotation.toDouble())
+                val cosA = cos(ang);
+                val sinA = sin(ang)
+                val dx = localDelX - cx;
+                val dy = localDelY - cy
+                val screenDelX = (cx + (dx * cosA - dy * sinA)).toFloat()
+                val screenDelY = (cy + (dx * sinA + dy * cosA)).toFloat()
 
-                _selectedShape?.let { shape ->
-                    // Check delete tap first
-                    val rect = RectF(shape.left, shape.top, shape.right, shape.bottom)
-                    val delX = rect.right + deleteIconPadding + deleteIconRadius
-                    val delY = rect.top - deleteIconPadding - deleteIconRadius
-                    if (distance(x, y, delX, delY) <= deleteIconRadius) {
-                        shapes.remove(shape)
-                        setSelected(null)
-                        return true
-                    }
+                if (distance(x, y, screenDelX, screenDelY) <= deleteHitRadius) {
+                    shapes.remove(shape)
+                    setSelected(null)
+                    return true
                 }
             }
         }
-        val action = event.actionMasked
 
-        when (action) {
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                val index = event.actionIndex
-                val pid = event.getPointerId(index)
-                val x = event.getX(index)
-                val y = event.getY(index)
+                val idx = event.actionIndex
+                val pid = event.getPointerId(idx)
+                val px = event.getX(idx)
+                val py = event.getY(idx)
 
                 activePointerId = pid
-                lastTouchX = x
-                lastTouchY = y
+                lastTouchX = px; lastTouchY = py
 
                 when (mode) {
                     Mode.PEN, Mode.ERASER, Mode.TEXT -> {
-                        val path = Path().apply { moveTo(x, y) }
+                        val path = Path().apply { moveTo(px, py) }
                         activePaths[pid] = path
                         activePaints[pid] = Paint(basePaint)
                     }
 
                     Mode.SHAPE -> {
-                        val hit = hitTestShape(x, y)
+                        val hit = hitTestShape(px, py)
                         if (hit != null && hit.shape != null) {
-                            // select shape and set activeHit
                             setSelected(hit.shape)
                             activeHit = hit.hitType
                         } else {
-                            // start creating a new shape
-                            shapeStart[pid] = Pair(x, y)
+                            shapeStart[pid] = Pair(px, py)
                             activePaints[pid] = Paint(basePaint)
                             activePaths[pid] = Path()
                             setSelected(null)
@@ -337,13 +382,13 @@ class DrawView @JvmOverloads constructor(
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.pointerCount) {
                     val pid = event.getPointerId(i)
-                    val x = event.getX(i)
-                    val y = event.getY(i)
+                    val px = event.getX(i)
+                    val py = event.getY(i)
 
                     when (mode) {
                         Mode.PEN, Mode.ERASER, Mode.TEXT -> {
                             val path = activePaths[pid]
-                            if (path != null) path.lineTo(x, y)
+                            if (path != null) path.lineTo(px, py)
                         }
 
                         Mode.SHAPE -> {
@@ -354,15 +399,15 @@ class DrawView @JvmOverloads constructor(
                                 when (shape) {
                                     Shape.RECT -> preview.addRect(
                                         RectF(
-                                            min(sx, x), min(sy, y), max(sx, x), max(sy, y)
+                                            min(sx, px), min(sy, py), max(sx, px), max(sy, py)
                                         ), Path.Direction.CW
                                     )
 
                                     Shape.CIRCLE -> {
-                                        val left = min(sx, x);
-                                        val top = min(sy, y)
-                                        val right = max(sx, x);
-                                        val bottom = max(sy, y)
+                                        val left = min(sx, px);
+                                        val top = min(sy, py)
+                                        val right = max(sx, px);
+                                        val bottom = max(sy, py)
                                         val cx = (left + right) / 2f;
                                         val cy = (top + bottom) / 2f
                                         val r = min(right - left, bottom - top) / 2f
@@ -370,23 +415,23 @@ class DrawView @JvmOverloads constructor(
                                     }
 
                                     Shape.LINE -> {
-                                        preview.moveTo(sx, sy); preview.lineTo(x, y)
+                                        preview.moveTo(sx, sy); preview.lineTo(px, py)
                                     }
 
                                     Shape.POLYGON -> {
-                                        val left = min(sx, x);
-                                        val top = min(sy, y)
-                                        val right = max(sx, x);
-                                        val bottom = max(sy, y)
+                                        val left = min(sx, px);
+                                        val top = min(sy, py)
+                                        val right = max(sx, px);
+                                        val bottom = max(sy, py)
                                         val cx = (left + right) / 2f;
                                         val cy = (top + bottom) / 2f
                                         val r = min(right - left, bottom - top) / 2f
                                         val p = Path()
                                         for (k in 0..4) {
                                             val ang = Math.toRadians((270 + k * 72).toDouble())
-                                            val px = (cx + r * cos(ang)).toFloat()
-                                            val py = (cy + r * sin(ang)).toFloat()
-                                            if (k == 0) p.moveTo(px, py) else p.lineTo(px, py)
+                                            val px2 = (cx + r * cos(ang)).toFloat()
+                                            val py2 = (cy + r * sin(ang)).toFloat()
+                                            if (k == 0) p.moveTo(px2, py2) else p.lineTo(px2, py2)
                                         }
                                         p.close()
                                         preview.addPath(p)
@@ -394,16 +439,15 @@ class DrawView @JvmOverloads constructor(
                                 }
                                 activePaths[pid] = preview
                             } else {
-                                // interacting with selected shape
                                 _selectedShape?.let { s ->
                                     if (activeHit == HitType.NONE) {
-                                        val hit = hitTestShape(x, y)
+                                        val hit = hitTestShape(px, py)
                                         if (hit != null && hit.shape == s) activeHit = hit.hitType
                                     }
                                     when (activeHit) {
                                         HitType.INSIDE -> {
-                                            val dx = x - lastTouchX;
-                                            val dy = y - lastTouchY
+                                            val dx = px - lastTouchX;
+                                            val dy = py - lastTouchY
                                             translateShapeBy(s, dx, dy)
                                         }
 
@@ -414,14 +458,15 @@ class DrawView @JvmOverloads constructor(
                                                 (lastTouchY - cy).toDouble(),
                                                 (lastTouchX - cx).toDouble()
                                             )
-                                            val a2 = atan2((y - cy).toDouble(), (x - cx).toDouble())
+                                            val a2 =
+                                                atan2((py - cy).toDouble(), (px - cx).toDouble())
                                             val deltaDeg = Math.toDegrees(a2 - a1).toFloat()
                                             s.rotation = (s.rotation + deltaDeg) % 360f
                                         }
 
                                         HitType.HANDLE_LT, HitType.HANDLE_T, HitType.HANDLE_RT, HitType.HANDLE_R, HitType.HANDLE_RB, HitType.HANDLE_B, HitType.HANDLE_LB, HitType.HANDLE_L -> {
-                                            val dx = x - lastTouchX;
-                                            val dy = y - lastTouchY
+                                            val dx = px - lastTouchX;
+                                            val dy = py - lastTouchY
                                             resizeShapeBy(s, activeHit, dx, dy)
                                         }
 
@@ -431,16 +476,16 @@ class DrawView @JvmOverloads constructor(
                             }
                         }
                     }
-                    lastTouchX = x; lastTouchY = y
+                    lastTouchX = px; lastTouchY = py
                 }
                 invalidate()
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
-                val index = event.actionIndex
-                val pid = event.getPointerId(index)
-                val x = event.getX(index)
-                val y = event.getY(index)
+                val idx = event.actionIndex
+                val pid = event.getPointerId(idx)
+                val px = event.getX(idx)
+                val py = event.getY(idx)
 
                 when (mode) {
                     Mode.PEN, Mode.ERASER, Mode.TEXT -> {
@@ -458,8 +503,8 @@ class DrawView @JvmOverloads constructor(
                         val paint = activePaints[pid]
                         if (start != null && paint != null) {
                             val (sx, sy) = start
-                            val dx = abs(x - sx);
-                            val dy = abs(y - sy)
+                            val dx = abs(px - sx);
+                            val dy = abs(py - sy)
                             val moved = hypot(dx.toDouble(), dy.toDouble()) > touchSlop
 
                             val left: Float;
@@ -476,8 +521,8 @@ class DrawView @JvmOverloads constructor(
                                 left = sx - half; top = sy - half; right = sx + half; bottom =
                                     sy + half
                             } else {
-                                left = min(sx, x); top = min(sy, y); right = max(sx, x); bottom =
-                                    max(sy, y)
+                                left = min(sx, px); top = min(sy, py); right = max(sx, px); bottom =
+                                    max(sy, py)
                             }
 
                             val model = ShapeModel(
@@ -488,15 +533,13 @@ class DrawView @JvmOverloads constructor(
                                 right = right,
                                 bottom = bottom,
                                 rotation = 0f,
-                                color = shapeBorderColor,
-                                strokeWidth = shapeBorderWidth,
+                                color = strokeColor,         // use current pen color
+                                strokeWidth = strokeWidth,   // use current pen width
                                 fillEnabled = shapeFillEnabled,
                                 fillColor = shapeFillColor
                             )
                             shapes.add(model)
                             setSelected(model)
-                        } else {
-                            // nothing to commit (likely transform)
                         }
                         shapeStart.remove(pid)
                         activePaths.remove(pid)
@@ -513,10 +556,9 @@ class DrawView @JvmOverloads constructor(
             }
         }
         return true
-
     }
 
-    // ---------- Hit testing & transforms ----------
+    // ---------- hit testing & transforms ----------
     private data class HitResult(val shape: ShapeModel?, val hitType: HitType)
 
     private fun hitTestShape(px: Float, py: Float): HitResult? {
@@ -628,11 +670,9 @@ class DrawView @JvmOverloads constructor(
         }
     }
 
-    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        return hypot((x2 - x1), (y2 - y1))
-    }
+    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float =
+        hypot((x2 - x1), (y2 - y1))
 
-    // ---------- Public APIs for selected-shape editing ----------
     fun updateSelectedShapeFillColor(color: Int) {
         _selectedShape?.let {
             it.fillColor = color
@@ -664,32 +704,5 @@ class DrawView @JvmOverloads constructor(
             invalidate()
             selectionListener?.invoke(getSelectedShape())
         }
-    }
-
-    // ---------- Utility / other API ----------
-    fun clear() {
-        strokes.clear()
-        shapes.clear()
-        setSelected(null)
-        activePaths.clear()
-        activePaints.clear()
-        shapeStart.clear()
-        invalidate()
-    }
-
-    fun undoStroke() {
-        if (strokes.isNotEmpty()) {
-            strokes.removeAt(strokes.lastIndex)
-            invalidate()
-        }
-    }
-
-    fun exportBitmap(): Bitmap {
-        val w = width.coerceAtLeast(1);
-        val h = height.coerceAtLeast(1)
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        draw(c)
-        return bmp
     }
 }
