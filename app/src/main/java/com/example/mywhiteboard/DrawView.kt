@@ -39,7 +39,7 @@ data class ShapeModel(
 }
 
 /**
- * DrawView: freehand strokes and shapes (create/select/transform/delete) with per-shape properties.
+ * DrawView: freehand strokes, shapes (create/select/transform/delete) and eraser with per-shape properties.
  */
 class DrawView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
@@ -93,14 +93,51 @@ class DrawView @JvmOverloads constructor(
     var shapeFillColor: Int = Color.TRANSPARENT
     var shapeFillEnabled: Boolean = false
 
-    // ---------- internal stroke bookkeeping ----------
-    private data class Stroke(val path: Path, val paint: Paint)
+    // eraser settings
+    var eraserRadiusDp: Float = 24f
+    private val eraserRadiusPx: Float get() = eraserRadiusDp.dp
+
+    // preview paints
+    private val eraserPreviewPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; color = Color.BLACK; alpha = 120
+    }
+    private val eraserPreviewBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.BLACK; alpha = 120; strokeWidth = 1f.dp
+    }
+
+    // shadow/overlay paints for trace visualization
+    // thick stroke along trace centerline (rounded)
+    private val eraserShadowStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.GRAY
+        alpha = 110
+    }
+
+    // dot paint for recorded points (smaller filled circles)
+    private val eraserShadowDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.GRAY
+        alpha = 110
+    }
+
+    // throttle for recording points (avoid too many points)
+    private val eraseRecordDistancePx: Float
+        get() = (eraserRadiusPx * 0.25f).coerceAtLeast(6f)
+
+    // internal stroke bookkeeping (vector)
+    private data class Stroke(var points: MutableList<PointF>, val paint: Paint)
 
     private val strokes = mutableListOf<Stroke>()
     private val activePaths = mutableMapOf<Int, Path>()
     private val activePaints = mutableMapOf<Int, Paint>()
+    private val activePoints =
+        mutableMapOf<Int, MutableList<PointF>>() // pointer -> stroke points (for pen)
 
-    // ---------- shape creation preview ----------
+    // eraser trace per pointer: list of recorded centers while moving
+    private val eraserTrace = mutableMapOf<Int, MutableList<PointF>>()
+
     private val shapeStart = mutableMapOf<Int, Pair<Float, Float>>()
 
     // ---------- shapes and selection ----------
@@ -180,8 +217,11 @@ class DrawView @JvmOverloads constructor(
         super.onDraw(canvas)
         canvas.drawColor(Color.WHITE)
 
-        // draw freehand strokes
-        for (s in strokes) canvas.drawPath(s.path, s.paint)
+        // draw strokes (rebuild path from points)
+        for (s in strokes) {
+            val p = buildPathFromPoints(s.points)
+            canvas.drawPath(p, s.paint)
+        }
 
         // draw shapes
         for (s in shapes) drawShapeModel(canvas, s)
@@ -192,8 +232,46 @@ class DrawView @JvmOverloads constructor(
             canvas.drawPath(path, p)
         }
 
+        // draw eraser trace shadow overlay for each active trace
+        // configure paints with proper width based on eraserRadius
+        eraserShadowStrokePaint.strokeWidth = eraserRadiusPx * 2f
+        eraserShadowDotPaint.strokeWidth = 1f
+
+        for ((_, trace) in eraserTrace) {
+            if (trace.size == 0) continue
+
+            // draw a smooth thick stroke along the trace centerline
+            if (trace.size >= 2) {
+                val tracePath = Path()
+                tracePath.moveTo(trace[0].x, trace[0].y)
+                for (i in 1 until trace.size) tracePath.lineTo(trace[i].x, trace[i].y)
+                canvas.drawPath(tracePath, eraserShadowStrokePaint)
+            }
+
+            // draw dots (extra visibility) — optional, keeps overlay visible when single point
+            for (pt in trace) {
+                canvas.drawCircle(pt.x, pt.y, eraserRadiusPx * 0.6f, eraserShadowDotPaint)
+            }
+        }
+
+        // eraser preview: draw the translucent circle at the lastTouch for feedback
+        if (mode == Mode.ERASER) {
+            val centerX = lastTouchX
+            val centerY = lastTouchY
+            canvas.drawCircle(centerX, centerY, eraserRadiusPx, eraserPreviewPaint)
+            canvas.drawCircle(centerX, centerY, eraserRadiusPx, eraserPreviewBorder)
+        }
+
         // draw selection if any
         _selectedShape?.let { drawSelection(canvas, it) }
+    }
+
+    private fun buildPathFromPoints(points: MutableList<PointF>): Path {
+        val path = Path()
+        if (points.isEmpty()) return path
+        path.moveTo(points[0].x, points[0].y)
+        for (i in 1 until points.size) path.lineTo(points[i].x, points[i].y)
+        return path
     }
 
     private fun drawShapeModel(canvas: Canvas, s: ShapeModel) {
@@ -277,9 +355,7 @@ class DrawView @JvmOverloads constructor(
         val redBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.TRANSPARENT; style = Paint.Style.FILL
         }
-        val bgRadius = deleteSizeDp / 2f
-        canvas.drawCircle(localDelX, localDelY, bgRadius, redBgPaint)
-
+        canvas.drawCircle(localDelX, localDelY, deleteSizeDp / 2f, redBgPaint)
         ensureDeleteBitmap()
         deleteBitmapScaled?.let { bmp ->
             val left = localDelX - bmp.width / 2f
@@ -356,10 +432,20 @@ class DrawView @JvmOverloads constructor(
                 lastTouchX = px; lastTouchY = py
 
                 when (mode) {
-                    Mode.PEN, Mode.ERASER, Mode.TEXT -> {
-                        val path = Path().apply { moveTo(px, py) }
-                        activePaths[pid] = path
+                    Mode.PEN, Mode.TEXT -> {
+                        activePoints[pid] = mutableListOf(PointF(px, py))
+                        activePaths[pid] = Path().apply { moveTo(px, py) }
                         activePaints[pid] = Paint(basePaint)
+                    }
+
+                    Mode.ERASER -> {
+                        // start recording eraser trace (no deletion yet)
+                        eraserTrace[pid] = mutableListOf(PointF(px, py))
+                        activePaths[pid] =
+                            Path().apply { moveTo(px, py) } // used for minimal preview
+                        activePaints[pid] =
+                            Paint().apply { style = Paint.Style.STROKE; strokeWidth = 1f }
+                        lastTouchX = px; lastTouchY = py
                     }
 
                     Mode.SHAPE -> {
@@ -386,9 +472,25 @@ class DrawView @JvmOverloads constructor(
                     val py = event.getY(i)
 
                     when (mode) {
-                        Mode.PEN, Mode.ERASER, Mode.TEXT -> {
-                            val path = activePaths[pid]
-                            if (path != null) path.lineTo(px, py)
+                        Mode.PEN, Mode.TEXT -> {
+                            activePoints[pid]?.add(PointF(px, py))
+                            activePaths[pid]?.lineTo(px, py)
+                        }
+
+                        Mode.ERASER -> {
+                            // record eraser trace but throttle by distance
+                            val trace = eraserTrace[pid]
+                            if (trace == null) {
+                                eraserTrace[pid] = mutableListOf(PointF(px, py))
+                            } else {
+                                val last = trace.last()
+                                if (distance(px, py, last.x, last.y) >= eraseRecordDistancePx) {
+                                    trace.add(PointF(px, py))
+                                }
+                            }
+                            // update preview center
+                            activePaths[pid]?.reset(); activePaths[pid]?.moveTo(px, py)
+                            lastTouchX = px; lastTouchY = py
                         }
 
                         Mode.SHAPE -> {
@@ -464,13 +566,15 @@ class DrawView @JvmOverloads constructor(
                                             s.rotation = (s.rotation + deltaDeg) % 360f
                                         }
 
-                                        HitType.HANDLE_LT, HitType.HANDLE_T, HitType.HANDLE_RT, HitType.HANDLE_R, HitType.HANDLE_RB, HitType.HANDLE_B, HitType.HANDLE_LB, HitType.HANDLE_L -> {
-                                            val dx = px - lastTouchX;
-                                            val dy = py - lastTouchY
-                                            resizeShapeBy(s, activeHit, dx, dy)
-                                        }
+                                        else -> when (activeHit) {
+                                            HitType.HANDLE_LT, HitType.HANDLE_T, HitType.HANDLE_RT, HitType.HANDLE_R, HitType.HANDLE_RB, HitType.HANDLE_B, HitType.HANDLE_LB, HitType.HANDLE_L -> {
+                                                val dx = px - lastTouchX;
+                                                val dy = py - lastTouchY
+                                                resizeShapeBy(s, activeHit, dx, dy)
+                                            }
 
-                                        else -> {}
+                                            else -> {}
+                                        }
                                     }
                                 }
                             }
@@ -488,14 +592,30 @@ class DrawView @JvmOverloads constructor(
                 val py = event.getY(idx)
 
                 when (mode) {
-                    Mode.PEN, Mode.ERASER, Mode.TEXT -> {
-                        val path = activePaths[pid];
+                    Mode.PEN, Mode.TEXT -> {
+                        val pts = activePoints[pid];
                         val paint = activePaints[pid]
-                        if (path != null && paint != null) strokes.add(
+                        if (pts != null && pts.size >= 2 && paint != null) strokes.add(
                             Stroke(
-                                Path(path), Paint(paint)
+                                pts.toMutableList(), Paint(paint)
                             )
                         )
+                        activePoints.remove(pid)
+                    }
+
+                    Mode.ERASER -> {
+                        // ON TOUCH-UP: perform erase for the entire recorded eraser trace
+                        val trace = eraserTrace[pid]
+                        if (trace != null && trace.isNotEmpty()) {
+                            performPartialEraseAlongTrace(trace, eraserRadiusPx)
+                        } else {
+                            // fallback: single-point erase at up position
+                            performPartialEraseAt(px, py, eraserRadiusPx)
+                        }
+                        // clear trace & preview
+                        eraserTrace.remove(pid)
+                        activePaths.remove(pid)
+                        activePaints.remove(pid)
                     }
 
                     Mode.SHAPE -> {
@@ -558,8 +678,93 @@ class DrawView @JvmOverloads constructor(
         return true
     }
 
-    // ---------- hit testing & transforms ----------
-    private data class HitResult(val shape: ShapeModel?, val hitType: HitType)
+    // Erase along a recorded trace: for each stroke segment, if ANY trace point's circle intersects it then remove that segment.
+    private fun performPartialEraseAlongTrace(trace: List<PointF>, radius: Float) {
+        if (trace.isEmpty()) return
+        val newStrokes = mutableListOf<Stroke>()
+        for (stroke in strokes) {
+            val pts = stroke.points
+            if (pts.size < 2) {
+                val single = pts.firstOrNull()
+                if (single != null) {
+                    var erased = false
+                    for (t in trace) {
+                        if (distance(
+                                single.x, single.y, t.x, t.y
+                            ) <= radius + stroke.paint.strokeWidth / 2f
+                        ) {
+                            erased = true; break
+                        }
+                    }
+                    if (!erased) newStrokes.add(stroke)
+                }
+                continue
+            }
+
+            val segmentRemoved = BooleanArray(pts.size - 1)
+            for (i in 0 until pts.size - 1) {
+                val a = pts[i];
+                val b = pts[i + 1]
+                var removeSeg = false
+                val effective = radius + stroke.paint.strokeWidth / 2f
+                for (t in trace) {
+                    val dist = distancePointToSegment(t.x, t.y, a.x, a.y, b.x, b.y)
+                    if (dist <= effective) {
+                        removeSeg = true; break
+                    }
+                }
+                if (removeSeg) segmentRemoved[i] = true
+            }
+
+            if (!segmentRemoved.any { it }) {
+                newStrokes.add(stroke); continue
+            }
+
+            // split into runs of kept segments
+            var currentPoints = mutableListOf<PointF>()
+            currentPoints.add(pts[0])
+            for (i in 0 until pts.size - 1) {
+                if (!segmentRemoved[i]) {
+                    currentPoints.add(pts[i + 1])
+                } else {
+                    if (currentPoints.size >= 2) {
+                        newStrokes.add(Stroke(currentPoints.toMutableList(), Paint(stroke.paint)))
+                    }
+                    currentPoints = mutableListOf()
+                    // start after removed segment - add next point as potential start
+                    currentPoints.add(pts[i + 1])
+                }
+            }
+            if (currentPoints.size >= 2) newStrokes.add(
+                Stroke(
+                    currentPoints.toMutableList(), Paint(stroke.paint)
+                )
+            )
+        }
+        strokes.clear(); strokes.addAll(newStrokes)
+    }
+
+    // fallback single point erase
+    private fun performPartialEraseAt(px: Float, py: Float, radius: Float) {
+        performPartialEraseAlongTrace(listOf(PointF(px, py)), radius)
+    }
+
+    private fun distancePointToSegment(
+        px: Float, py: Float, x1: Float, y1: Float, x2: Float, y2: Float
+    ): Float {
+        val vx = x2 - x1;
+        val vy = y2 - y1
+        val wx = px - x1;
+        val wy = py - y1
+        val c1 = vx * wx + vy * wy
+        if (c1 <= 0) return hypot(px - x1, py - y1)
+        val c2 = vx * vx + vy * vy
+        if (c2 <= c1) return hypot(px - x2, py - y2)
+        val b = c1 / c2
+        val pbx = x1 + b * vx;
+        val pby = y1 + b * vy
+        return hypot(px - pbx, py - pby)
+    }
 
     private fun hitTestShape(px: Float, py: Float): HitResult? {
         for (i in shapes.indices.reversed()) {
@@ -597,6 +802,8 @@ class DrawView @JvmOverloads constructor(
         }
         return null
     }
+
+    private data class HitResult(val shape: ShapeModel?, val hitType: HitType)
 
     private fun screenToLocal(s: ShapeModel, px: Float, py: Float): PointF {
         val cx = s.centerX();

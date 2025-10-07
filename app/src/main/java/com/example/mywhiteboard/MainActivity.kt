@@ -51,6 +51,9 @@ class MainActivity : AppCompatActivity() {
             binding.drawView.mode = DrawView.Mode.PEN
             showPenChooser(it)
         }
+        binding.btnEraser.setOnClickListener {
+            binding.drawView.mode = DrawView.Mode.ERASER
+        }
         binding.btnShapes.setOnClickListener {
             binding.drawView.mode = DrawView.Mode.SHAPE
             showShapeChooser(it)
