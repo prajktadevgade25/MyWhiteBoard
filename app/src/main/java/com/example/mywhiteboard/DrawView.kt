@@ -18,6 +18,8 @@ import kotlin.math.*
 /**
  * Model representing a single shape on the whiteboard.
  * 'color' is the stroke (border) color. 'fillEnabled' + 'fillColor' control filling.
+ *
+ * Extended to support TEXT kind with text content, size, and color.
  */
 data class ShapeModel(
     var id: String,
@@ -30,7 +32,12 @@ data class ShapeModel(
     var color: Int,
     var strokeWidth: Float = 6f,
     var fillEnabled: Boolean = false,
-    var fillColor: Int = Color.TRANSPARENT
+    var fillColor: Int = Color.TRANSPARENT,
+
+    // TEXT-specific:
+    var text: String = "",
+    var textSize: Float = 18f,    // px
+    var textColor: Int = Color.BLACK
 ) {
     fun centerX() = (left + right) / 2f
     fun centerY() = (top + bottom) / 2f
@@ -39,7 +46,7 @@ data class ShapeModel(
 }
 
 /**
- * DrawView: freehand strokes, shapes (create/select/transform/delete) and eraser with per-shape properties.
+ * DrawView: freehand strokes, shapes (create/select/transform/delete), text boxes, and eraser.
  */
 class DrawView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
@@ -47,7 +54,7 @@ class DrawView @JvmOverloads constructor(
 
     // public enums
     enum class Mode { PEN, ERASER, SHAPE, TEXT }
-    enum class Shape { RECT, CIRCLE, LINE, POLYGON }
+    enum class Shape { RECT, CIRCLE, LINE, POLYGON, TEXT } // <-- added TEXT
 
     // dp helper
     private val Float.dp: Float get() = this * resources.displayMetrics.density
@@ -156,6 +163,13 @@ class DrawView @JvmOverloads constructor(
         selectionListener = listener
     }
 
+    // ---------- text edit listener ----------
+    // Host should implement editing UI (dialog/EditText) and call updateSelectedShapeText(...)
+    private var textEditListener: ((ShapeModel) -> Unit)? = null
+    fun setOnTextEditRequestedListener(listener: (ShapeModel) -> Unit) {
+        textEditListener = listener
+    }
+
     // ---------- paints for rendering shapes and selection ----------
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -172,6 +186,12 @@ class DrawView @JvmOverloads constructor(
     }
     private val rotateHandlePaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = Color.YELLOW }
+
+    // text paint (reused for drawing text)
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        textAlign = Paint.Align.CENTER
+    }
 
     private val HANDLE_SIZE = 14f.dp
     private val ROTATE_HANDLE_DISTANCE = 36f.dp
@@ -287,7 +307,41 @@ class DrawView @JvmOverloads constructor(
         strokePaint.color = s.color
         strokePaint.strokeWidth = s.strokeWidth
         strokePaint.style = Paint.Style.STROKE
-        canvas.drawPath(buildShapePath(s), strokePaint)
+
+        // for TEXT: draw rectangular box (optional) then text
+        if (s.kind == Shape.TEXT) {
+            // optional: draw background box if fillEnabled
+            if (s.fillEnabled) {
+                fillPaint.color = s.fillColor
+                canvas.drawRect(RectF(s.left, s.top, s.right, s.bottom), fillPaint)
+            }
+            // border
+            canvas.drawRect(RectF(s.left, s.top, s.right, s.bottom), strokePaint)
+
+            // draw text centered in the rect
+            textPaint.textSize = s.textSize
+            textPaint.color = s.textColor
+            textPaint.textAlign = Paint.Align.CENTER
+
+            // compute baseline for vertical centering
+            val rect = RectF(s.left, s.top, s.right, s.bottom)
+            val fm = textPaint.fontMetrics
+            val textHeight = fm.descent - fm.ascent
+            val textBaseline = rect.centerY() - (fm.ascent + fm.descent) / 2f
+
+            // draw multi-line support by splitting on '\n'
+            val lines = s.text.split("\n")
+            // simple vertical stacking
+            val lineSpacing = 4f.dp
+            val totalTextHeight = lines.size * textHeight + (lines.size - 1) * lineSpacing
+            var startY = textBaseline - (totalTextHeight / 2f) + textHeight / 2f
+            for (line in lines) {
+                canvas.drawText(line, rect.centerX(), startY, textPaint)
+                startY += textHeight + lineSpacing
+            }
+        } else {
+            canvas.drawPath(buildShapePath(s), strokePaint)
+        }
 
         canvas.restoreToCount(save)
     }
@@ -318,6 +372,11 @@ class DrawView @JvmOverloads constructor(
                     if (i == 0) p.moveTo(px, py) else p.lineTo(px, py)
                 }
                 p.close()
+            }
+
+            Shape.TEXT -> {
+                // For shapes other than simple rect we keep a rect path for selection drawing etc.
+                p.addRect(RectF(s.left, s.top, s.right, s.bottom), Path.Direction.CW)
             }
         }
         return p
@@ -432,7 +491,7 @@ class DrawView @JvmOverloads constructor(
                 lastTouchX = px; lastTouchY = py
 
                 when (mode) {
-                    Mode.PEN, Mode.TEXT -> {
+                    Mode.PEN -> {
                         activePoints[pid] = mutableListOf(PointF(px, py))
                         activePaths[pid] = Path().apply { moveTo(px, py) }
                         activePaints[pid] = Paint(basePaint)
@@ -461,6 +520,26 @@ class DrawView @JvmOverloads constructor(
                             activeHit = HitType.NONE
                         }
                     }
+
+                    Mode.TEXT -> {
+                        // For text mode, on down we just prepare - actual insertion at UP if not moved.
+                        // Also, if user tapped inside an existing text shape -> select and request edit.
+                        val hit = hitTestShape(px, py)
+                        if (hit != null && hit.shape != null) {
+                            setSelected(hit.shape)
+                            activeHit = hit.hitType
+                            // If tapped inside a TEXT shape, request editing (host handles keyboard/UI)
+                            if (hit.shape.kind == Shape.TEXT && hit.hitType == HitType.INSIDE) {
+                                // delay the edit request until ACTION_UP (so user can do move instead)
+                                // mark pointer -> we will check on ACTION_UP if it's a tap (not move)
+                                shapeStart[pid] = Pair(px, py)
+                            }
+                        } else {
+                            // create start anchor so we can create a new text on UP if it's a tap (no big move)
+                            shapeStart[pid] = Pair(px, py)
+                            setSelected(null)
+                        }
+                    }
                 }
                 invalidate()
             }
@@ -472,7 +551,7 @@ class DrawView @JvmOverloads constructor(
                     val py = event.getY(i)
 
                     when (mode) {
-                        Mode.PEN, Mode.TEXT -> {
+                        Mode.PEN -> {
                             activePoints[pid]?.add(PointF(px, py))
                             activePaths[pid]?.lineTo(px, py)
                         }
@@ -538,6 +617,7 @@ class DrawView @JvmOverloads constructor(
                                         p.close()
                                         preview.addPath(p)
                                     }
+                                    else -> {}
                                 }
                                 activePaths[pid] = preview
                             } else {
@@ -579,6 +659,23 @@ class DrawView @JvmOverloads constructor(
                                 }
                             }
                         }
+
+                        Mode.TEXT -> {
+                            // If user is dragging and a shape is selected, move it
+                            val start = shapeStart[pid]
+                            if (start != null && _selectedShape != null && _selectedShape!!.kind == Shape.TEXT) {
+                                val moved = distance(px, py, start.first, start.second) > touchSlop
+                                if (moved && activeHit == HitType.NONE) {
+                                    // start moving selected text
+                                    activeHit = HitType.INSIDE
+                                }
+                                if (activeHit == HitType.INSIDE) {
+                                    val dx = px - lastTouchX
+                                    val dy = py - lastTouchY
+                                    translateShapeBy(_selectedShape!!, dx, dy)
+                                }
+                            }
+                        }
                     }
                     lastTouchX = px; lastTouchY = py
                 }
@@ -592,7 +689,7 @@ class DrawView @JvmOverloads constructor(
                 val py = event.getY(idx)
 
                 when (mode) {
-                    Mode.PEN, Mode.TEXT -> {
+                    Mode.PEN -> {
                         val pts = activePoints[pid];
                         val paint = activePaints[pid]
                         if (pts != null && pts.size >= 2 && paint != null) strokes.add(
@@ -665,6 +762,53 @@ class DrawView @JvmOverloads constructor(
                         activePaths.remove(pid)
                         activePaints.remove(pid)
                     }
+
+                    Mode.TEXT -> {
+                        val start = shapeStart[pid]
+                        // If start exists and user didn't move much => treat as tap to insert or tap-to-edit
+                        if (start != null) {
+                            val sx = start.first; val sy = start.second
+                            val moved = distance(px, py, sx, sy) > touchSlop
+                            val hit = hitTestShape(px, py)
+                            if (!moved && hit == null) {
+                                // Insert a new text box centered at tap with default size
+                                val halfW = if (shapeDefaultWidth > 0f) shapeDefaultWidth / 2f else 80f.dp
+                                val halfH = if (shapeDefaultHeight > 0f) shapeDefaultHeight / 2f else 24f.dp * 3
+                                val left = sx - halfW; val top = sy - halfH; val right = sx + halfW; val bottom = sy + halfH
+                                val model = ShapeModel(
+                                    id = System.currentTimeMillis().toString(),
+                                    kind = Shape.TEXT,
+                                    left = left,
+                                    top = top,
+                                    right = right,
+                                    bottom = bottom,
+                                    rotation = 0f,
+                                    color = strokeColor,
+                                    strokeWidth = strokeWidth,
+                                    fillEnabled = false,
+                                    fillColor = Color.TRANSPARENT,
+                                    text = "Tap to edit",
+                                    textSize = 18f.dp,
+                                    textColor = strokeColor
+                                )
+                                shapes.add(model)
+                                setSelected(model)
+                                // Ask host to open text edit UI if they want to immediately edit
+                                textEditListener?.invoke(model)
+                            } else if (!moved && hit != null && hit.shape != null && hit.shape.kind == Shape.TEXT) {
+                                // Tapped inside existing text - request edit
+                                setSelected(hit.shape)
+                                textEditListener?.invoke(hit.shape)
+                            } else {
+                                // If moved and selected shape is text, keep the transform done in MOVE handling
+                                // finalize selected shape so selection listener sees final values
+                                _selectedShape?.let { selectionListener?.invoke(getSelectedShape()) }
+                            }
+                        }
+                        shapeStart.remove(pid)
+                        activePaths.remove(pid)
+                        activePaints.remove(pid)
+                    }
                 }
 
                 // cleanup
@@ -679,6 +823,7 @@ class DrawView @JvmOverloads constructor(
     }
 
     // Erase along a recorded trace: for each stroke segment, if ANY trace point's circle intersects it then remove that segment.
+    // Extended: also remove whole text shapes if the trace intersects their bounding box (pixel-based erase).
     private fun performPartialEraseAlongTrace(trace: List<PointF>, radius: Float) {
         if (trace.isEmpty()) return
         val newStrokes = mutableListOf<Stroke>()
@@ -742,6 +887,30 @@ class DrawView @JvmOverloads constructor(
             )
         }
         strokes.clear(); strokes.addAll(newStrokes)
+
+        // --- new: check shapes (TEXT) for intersection with trace and remove them if overlapped ---
+        val removeShapeIds = mutableSetOf<String>()
+        for (s in shapes) {
+            if (s.kind == Shape.TEXT) {
+                // For each trace point check if inside rotated rect (inflated by radius)
+                val inflated = radius + max(s.width(), s.height()) * 0.05f // small tolerance
+                val rect = RectF(s.left - inflated, s.top - inflated, s.right + inflated, s.bottom + inflated)
+                for (t in trace) {
+                    val local = screenToLocal(s, t.x, t.y)
+                    if (local.x >= rect.left && local.x <= rect.right && local.y >= rect.top && local.y <= rect.bottom) {
+                        removeShapeIds.add(s.id)
+                        break
+                    }
+                }
+            } else {
+                // Optionally, you could also let eraser delete other filled shapes by intersection; left out for now
+            }
+        }
+        if (removeShapeIds.isNotEmpty()) {
+            shapes.removeAll { removeShapeIds.contains(it.id) }
+            // if selected got removed, clear selection
+            _selectedShape?.let { if (removeShapeIds.contains(it.id)) setSelected(null) }
+        }
     }
 
     // fallback single point erase
@@ -880,10 +1049,40 @@ class DrawView @JvmOverloads constructor(
     private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float =
         hypot((x2 - x1), (y2 - y1))
 
+    // ---- Public helper methods to let host update selected text box ----
+    fun updateSelectedShapeText(text: String) {
+        _selectedShape?.let {
+            it.text = text
+            // apply back to shapes list
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
+            invalidate()
+            selectionListener?.invoke(getSelectedShape())
+        }
+    }
+
+    fun updateSelectedShapeTextSize(sizePx: Float) {
+        _selectedShape?.let {
+            it.textSize = sizePx
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
+            invalidate()
+            selectionListener?.invoke(getSelectedShape())
+        }
+    }
+
+    fun updateSelectedShapeTextColor(color: Int) {
+        _selectedShape?.let {
+            it.textColor = color
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
+            invalidate()
+            selectionListener?.invoke(getSelectedShape())
+        }
+    }
+
     fun updateSelectedShapeFillColor(color: Int) {
         _selectedShape?.let {
             it.fillColor = color
             it.fillEnabled = true
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
             invalidate()
             selectionListener?.invoke(getSelectedShape())
         }
@@ -892,6 +1091,7 @@ class DrawView @JvmOverloads constructor(
     fun setSelectedShapeFillEnabled(enabled: Boolean) {
         _selectedShape?.let {
             it.fillEnabled = enabled
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
             invalidate()
             selectionListener?.invoke(getSelectedShape())
         }
@@ -900,6 +1100,7 @@ class DrawView @JvmOverloads constructor(
     fun updateSelectedShapeBorderColor(color: Int) {
         _selectedShape?.let {
             it.color = color
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
             invalidate()
             selectionListener?.invoke(getSelectedShape())
         }
@@ -908,6 +1109,7 @@ class DrawView @JvmOverloads constructor(
     fun updateSelectedShapeStrokeWidth(width: Float) {
         _selectedShape?.let {
             it.strokeWidth = width
+            for (i in shapes.indices) if (shapes[i].id == it.id) { shapes[i] = it.copy(); break }
             invalidate()
             selectionListener?.invoke(getSelectedShape())
         }

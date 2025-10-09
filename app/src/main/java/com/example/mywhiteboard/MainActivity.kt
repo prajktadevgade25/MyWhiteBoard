@@ -7,12 +7,15 @@ import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.SeekBar
+import android.widget.TextView
 import android.widget.PopupWindow
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
@@ -58,6 +61,9 @@ class MainActivity : AppCompatActivity() {
             binding.drawView.mode = DrawView.Mode.SHAPE
             showShapeChooser(it)
         }
+        binding.btnText.setOnClickListener {
+            binding.drawView.mode = DrawView.Mode.TEXT
+        }
 
         // Shape creation defaults
         binding.drawView.shapeDefaultWidth = 600f
@@ -73,6 +79,7 @@ class MainActivity : AppCompatActivity() {
         val btnFill: ImageButton? = propBarRoot?.findViewById(R.id.btnFillColor)
         val btnBorder: ImageButton? = propBarRoot?.findViewById(R.id.btnBorderColor)
         val seekWidth: SeekBar? = propBarRoot?.findViewById(R.id.seekWidth)
+        val tvPropLabel: TextView? = propBarRoot?.findViewById(R.id.tvPropLabel) // optional label (if available)
 
         // Initially hide the property bar if present
         propBarRoot?.visibility = View.GONE
@@ -82,9 +89,24 @@ class MainActivity : AppCompatActivity() {
             if (selected != null) {
                 // show and populate
                 propBarRoot?.visibility = View.VISIBLE
-                btnFill?.setBackgroundColor(if (selected.fillEnabled) selected.fillColor else Color.TRANSPARENT)
-                btnBorder?.setBackgroundColor(selected.color)
-                seekWidth?.progress = selected.strokeWidth.toInt().coerceIn(1, seekWidth?.max ?: 60)
+
+                if (selected.kind == DrawView.Shape.TEXT) {
+                    // For text boxes:
+                    tvPropLabel?.text = "Text properties"
+                    // Use border swatch for text color
+                    btnBorder?.setBackgroundColor(selected.textColor)
+                    // Fill button used for background fill of text box
+                    btnFill?.setBackgroundColor(if (selected.fillEnabled) selected.fillColor else Color.TRANSPARENT)
+                    // Seekbar controls text size
+                    val sizePx = selected.textSize.toInt().coerceIn(8, seekWidth?.max ?: 200)
+                    seekWidth?.progress = sizePx
+                } else {
+                    // For other shapes:
+                    tvPropLabel?.text = "Shape properties"
+                    btnFill?.setBackgroundColor(if (selected.fillEnabled) selected.fillColor else Color.TRANSPARENT)
+                    btnBorder?.setBackgroundColor(selected.color)
+                    seekWidth?.progress = selected.strokeWidth.toInt().coerceIn(1, seekWidth?.max ?: 60)
+                }
             } else {
                 propBarRoot?.visibility = View.GONE
             }
@@ -93,32 +115,103 @@ class MainActivity : AppCompatActivity() {
         // Fill swatch clicked -> color picker
         btnFill?.setOnClickListener {
             showColorPicker { color ->
-                binding.drawView.updateSelectedShapeFillColor(color)
-                binding.drawView.setSelectedShapeFillEnabled(true)
-                btnFill.setBackgroundColor(color)
+                // If selected is text, treat as text-box background; otherwise shape fill
+                val sel = binding.drawView.getSelectedShape()
+                if (sel != null && sel.kind == DrawView.Shape.TEXT) {
+                    binding.drawView.updateSelectedShapeFillColor(color)
+                    binding.drawView.setSelectedShapeFillEnabled(true)
+                    btnFill.setBackgroundColor(color)
+                } else {
+                    binding.drawView.updateSelectedShapeFillColor(color)
+                    binding.drawView.setSelectedShapeFillEnabled(true)
+                    btnFill.setBackgroundColor(color)
+                }
             }
         }
 
         // Border swatch clicked -> color picker
         btnBorder?.setOnClickListener {
             showColorPicker { color ->
-                binding.drawView.updateSelectedShapeBorderColor(color)
-                btnBorder.setBackgroundColor(color)
+                val sel = binding.drawView.getSelectedShape()
+                if (sel != null && sel.kind == DrawView.Shape.TEXT) {
+                    // update text color
+                    binding.drawView.updateSelectedShapeTextColor(color)
+                    btnBorder.setBackgroundColor(color)
+                } else {
+                    binding.drawView.updateSelectedShapeBorderColor(color)
+                    btnBorder.setBackgroundColor(color)
+                }
             }
         }
 
-        // Width slider
-        seekWidth?.max = 60
+        // Width slider: use for stroke width or text size depending on selection
+        seekWidth?.max = 200
         seekWidth?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                val w = progress.coerceAtLeast(1).toFloat()
-                binding.drawView.updateSelectedShapeStrokeWidth(w)
+                val sel = binding.drawView.getSelectedShape()
+                if (sel != null) {
+                    if (sel.kind == DrawView.Shape.TEXT) {
+                        val px = progress.coerceAtLeast(8).toFloat()
+                        binding.drawView.updateSelectedShapeTextSize(px)
+                    } else {
+                        val w = progress.coerceAtLeast(1).toFloat()
+                        binding.drawView.updateSelectedShapeStrokeWidth(w)
+                    }
+                }
             }
 
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
-    }
+
+        // ---------- handle text edit requests coming from DrawView ----------
+        binding.drawView.setOnTextEditRequestedListener { shape ->
+            // Open a simple dialog with EditText to edit content and buttons to change color/size if desired.
+            val inflater = LayoutInflater.from(this)
+            val dialogView = inflater.inflate(R.layout.dialog_edit_text, null) // you'll create this layout
+            val et = dialogView.findViewById<EditText>(R.id.etText)
+            val btnColor = dialogView.findViewById<ImageButton>(R.id.btnTextColor)
+            val seekTextSize = dialogView.findViewById<SeekBar>(R.id.seekTextSize)
+
+            // populate initial values
+            et.setText(shape.text)
+            seekTextSize.max = 200
+            seekTextSize.progress = shape.textSize.toInt().coerceIn(8, 200)
+            btnColor.setBackgroundColor(shape.textColor)
+
+            val builder = AlertDialog.Builder(this)
+                .setTitle("Edit text")
+                .setView(dialogView)
+                .setPositiveButton("OK") { d, _ ->
+                    val newText = et.text.toString()
+                    binding.drawView.updateSelectedShapeText(newText)
+                    binding.drawView.updateSelectedShapeTextSize(seekTextSize.progress.toFloat())
+                    // color already applied via picker callback below
+                }
+                .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+
+            val dialog = builder.show()
+
+            // color picker button inside dialog
+            btnColor.setOnClickListener {
+                showColorPicker { color ->
+                    btnColor.setBackgroundColor(color)
+                    binding.drawView.updateSelectedShapeTextColor(color)
+                }
+            }
+
+            // seek listener updates preview on host view directly as user slides
+            seekTextSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    binding.drawView.updateSelectedShapeTextSize(progress.toFloat().coerceAtLeast(8f))
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+
+    } // onCreate end
 
     // ---------- color picker: simple grid of preset colors ----------
     private fun showColorPicker(onColorChosen: (Int) -> Unit) {
@@ -137,7 +230,6 @@ class MainActivity : AppCompatActivity() {
 
         for (c in colors) {
             val v = View(this).apply {
-                // Use WRAP_CONTENT here and set layout params in GridLayout.LayoutParams
                 setBackgroundColor(c)
                 setOnClickListener {
                     onColorChosen(c)
